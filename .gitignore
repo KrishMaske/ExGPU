@@ -32,6 +32,17 @@ build/
 ### VS Code ###
 .vscode/
 *.docx
+leaks-report.json
+
+### Secrets / env (never commit) ###
+.env
+**/.env
+*.env
+!**/.env.example
+
+### Node / frontend ###
+node_modules/
+.next/
 
 ### Private project files (never commit) ###
 /.claude/

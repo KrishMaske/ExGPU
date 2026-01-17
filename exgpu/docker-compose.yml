@@ -1,42 +1,113 @@
-version: '3.8'
+# RESTART / REBOOT BEHAVIOUR
+# - Every service is "restart: unless-stopped", so the stack comes back automatically after
+#   a host reboot or a Docker Desktop restart. It is deliberately NOT "always": an explicit
+#   `docker compose stop` then stays stopped instead of resurrecting at next boot.
+# - Postgres and Zookeeper have healthchecks, and their dependents wait on
+#   condition: service_healthy. On a reboot every container starts at once, and without this
+#   Kafka regularly loses the race against Zookeeper and dies before the restart policy
+#   catches it.
+# - Postgres data lives in the named volume postgres_data, which survives `docker compose
+#   down`. It does NOT survive `docker compose down -v` — that deletes the volume.
+#
+# SECURITY NOTES
+# - All host ports are bound to 127.0.0.1 so these services are reachable only from this
+#   machine, never the LAN. Remove the "127.0.0.1:" prefix only if you knowingly need
+#   network access and have a firewall in front.
+# - Credentials default to dev values but can be overridden via a .env file (see .env.example).
+#   Never ship the defaults to a shared/remote environment.
 
 services:
   postgres:
     image: postgres:16
     container_name: exgpu-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: exgpu
-      POSTGRES_USER: exgpu
-      POSTGRES_PASSWORD: exgpu
+      POSTGRES_DB: ${POSTGRES_DB:-exgpu}
+      POSTGRES_USER: ${POSTGRES_USER:-exgpu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-exgpu}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # -q keeps the probe silent; the exit code is what Compose reads.
+      test: ["CMD-SHELL", "pg_isready -q -U ${POSTGRES_USER:-exgpu} -d ${POSTGRES_DB:-exgpu}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      # Postgres runs initdb on a fresh volume, which can take a while on first boot.
+      start_period: 30s
 
   redis:
     image: redis:7
     container_name: exgpu-redis
+    restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: exgpu-zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+    healthcheck:
+      # Deliberately not the "ruok" four-letter command: ZooKeeper 3.5+ refuses those unless
+      # whitelisted, and this image does not translate ZOOKEEPER_4LW_COMMANDS_WHITELIST into
+      # the JVM property, so the probe silently fails forever. Listing the root znode needs
+      # no whitelist and is a stronger signal anyway — it proves ZooKeeper is actually
+      # serving requests, not merely holding the port open.
+      test: ["CMD-SHELL", "zookeeper-shell localhost:2181 ls / >/dev/null 2>&1"]
+      interval: 10s
+      # zookeeper-shell boots a JVM (~2s), so the timeout has real headroom.
+      timeout: 10s
+      retries: 10
+      start_period: 20s
 
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: exgpu-kafka
+    restart: unless-stopped
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: exgpu-prometheus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on: []
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: exgpu-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      # Don't allow anonymous access or sign-ups to the dashboards.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   postgres_data:
+  grafana_data:
