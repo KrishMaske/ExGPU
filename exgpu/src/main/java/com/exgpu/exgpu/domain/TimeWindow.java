@@ -9,6 +9,8 @@ public class TimeWindow {
     private Instant start;
     private Instant end;
 
+    protected TimeWindow() {}
+
     public TimeWindow(Instant start, Instant end) {
         if (start.isAfter(end)) {
             throw new IllegalArgumentException("Start time must be before end time");

@@ -19,6 +19,7 @@ import lombok.Setter;
 import lombok.NoArgsConstructor;
 import lombok.AccessLevel;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -42,7 +43,17 @@ public class Allocation {
     
     @Column(name="sell_order_id", nullable=false)
     private UUID sellOrderId;
-    
+
+    // Denormalized from the buy order's owner so billing has an authoritative payer
+    // without re-reading the order. Set by the matching engine at match time.
+    @Column(name="buyer_id")
+    private UUID buyerId;
+
+    // The price the trade cleared at (the resting/maker order's price). Billing reads
+    // this instead of trusting a price supplied on the incoming usage event.
+    @Column(name="execution_price", precision=10, scale=4)
+    private BigDecimal executionPrice;
+
     @Column(name="quantity", nullable=false)
     private int quantity;
 
@@ -58,6 +69,13 @@ public class Allocation {
     @Builder.Default
     private AllocationStatus status = AllocationStatus.ACTIVE;
 
+    @Column(name = "cancelled_at")
+    private Instant cancelledAt;
+
+    /** Amount actually returned to the buyer on cancellation; null while not cancelled. */
+    @Column(name = "refunded_amount", precision = 18, scale = 6)
+    private BigDecimal refundedAmount;
+
     @CreationTimestamp
     @Column(name = "created_at", updatable = false, nullable = false)
     private Instant createdAt;
@@ -69,6 +87,8 @@ public class Allocation {
                 "id=" + id +
                 ", buyOrderId=" + buyOrderId +
                 ", sellOrderId=" + sellOrderId +
+                ", buyerId=" + buyerId +
+                ", executionPrice=" + executionPrice +
                 ", quantity=" + quantity +
                 ", window=" + window +
                 ", status=" + status +

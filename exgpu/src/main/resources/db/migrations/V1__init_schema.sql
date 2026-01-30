@@ -1,25 +1,20 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- ENUMS
-CREATE TYPE order_side AS ENUM ('BUY', 'SELL');
-CREATE TYPE order_status AS ENUM ('OPEN', 'PARTIALLY_FILLED', 'FILLED', 'EXPIRED', 'CANCELLED');
-CREATE TYPE allocation_status AS ENUM ('ACTIVE', 'COMPLETED', 'KILLED');
-
 -- ORDERS
 CREATE TABLE orders (
     id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     owner_id            UUID NOT NULL,
-    side                order_side NOT NULL,
-    status              order_status NOT NULL DEFAULT 'OPEN',
+    side                VARCHAR(10) NOT NULL,
+    status              VARCHAR(20) NOT NULL DEFAULT 'OPEN',
     price_per_gpu_hr    NUMERIC(10,4) NOT NULL,
     quantity            INT NOT NULL,
     filled_quantity     INT NOT NULL DEFAULT 0,
-    window_start        TIMESTAMP NOT NULL,
-    window_end          TIMESTAMP NOT NULL,
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
     recurring           BOOLEAN NOT NULL DEFAULT FALSE,
     recurrence_pattern  VARCHAR(20),
-    priority_timestamp  TIMESTAMP NOT NULL,
-    created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+    priority_timestamp  TIMESTAMPTZ NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_window CHECK (window_end > window_start),
     CONSTRAINT chk_quantity CHECK (quantity > 0),
@@ -36,10 +31,10 @@ CREATE TABLE allocations (
     buy_order_id    UUID NOT NULL,
     sell_order_id   UUID NOT NULL,
     quantity        INT NOT NULL,
-    window_start    TIMESTAMP NOT NULL,
-    window_end      TIMESTAMP NOT NULL,
-    status          allocation_status NOT NULL DEFAULT 'ACTIVE',
-    created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+    window_start    TIMESTAMPTZ NOT NULL,
+    window_end      TIMESTAMPTZ NOT NULL,
+    status          VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_alloc_window CHECK (window_end > window_start),
     CONSTRAINT chk_alloc_quantity CHECK (quantity > 0),
@@ -55,8 +50,8 @@ CREATE TABLE token_balances (
     buyer_id        UUID PRIMARY KEY,
     balance         NUMERIC(18,6) NOT NULL DEFAULT 0,
     version         BIGINT NOT NULL DEFAULT 0,
-    created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_balance CHECK (balance >= 0)
 );
@@ -69,7 +64,7 @@ CREATE TABLE usage_ledger (
     gpu_seconds         BIGINT NOT NULL,
     token_cost          NUMERIC(18,6) NOT NULL,
     idempotency_key     VARCHAR(255) NOT NULL UNIQUE,
-    created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_gpu_seconds CHECK (gpu_seconds > 0),
     CONSTRAINT chk_token_cost CHECK (token_cost > 0),
@@ -89,7 +84,7 @@ CREATE TABLE audit_log (
     action          VARCHAR(50) NOT NULL,
     old_value       TEXT,
     new_value       TEXT,
-    created_at      TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_audit_log_entity ON audit_log(entity_type, entity_id);
