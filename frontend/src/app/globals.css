@@ -1,0 +1,269 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  Theme tokens.
+
+  Values are space-separated RGB channels, not colours — tailwind.config.ts wraps each one as
+  rgb(var(--x) / <alpha-value>) so that opacity modifiers keep working. Writing "#7C3AED" here
+  would break every bg-caution/[0.07] in the codebase.
+
+  Light is the default. Dark is defined under BOTH the system preference and an explicit
+  [data-theme="dark"], so the OS setting is respected out of the box and the in-app toggle can
+  still override it in either direction.
+*/
+:root {
+  --brand-50: 246 243 255;
+  --brand-100: 237 231 254;
+  --brand-200: 220 207 253;
+  --brand-300: 195 171 251;
+  --brand-400: 164 125 247;
+  --brand-500: 139 92 246;
+  --brand-600: 124 58 237;
+  --brand-700: 109 40 217;
+  --brand-800: 91 33 182;
+  --brand-900: 76 29 149;
+
+  --surface: 255 255 255;
+  --surface-muted: 250 250 252;
+  --surface-sunken: 244 244 248;
+
+  --ink: 14 14 19;
+  --ink-soft: 74 74 90;
+  --ink-muted: 117 117 138;
+  --ink-faint: 160 160 180;
+
+  --line: 233 233 240;
+  --line-strong: 216 216 228;
+
+  --positive: 11 138 91;
+  --negative: 210 45 45;
+  --caution: 180 83 9;
+
+  --shadow-card: 0 1px 2px rgba(16, 16, 32, 0.04), 0 1px 3px rgba(16, 16, 32, 0.06);
+  --shadow-lift: 0 4px 12px rgba(16, 16, 32, 0.08), 0 2px 4px rgba(16, 16, 32, 0.04);
+  --shadow-brand: 0 4px 14px rgba(124, 58, 237, 0.25);
+
+  color-scheme: light;
+}
+
+/*
+  Dark palette.
+
+  The brand ramp is deliberately flipped at the ends rather than merely darkened. The ramp is
+  used semantically — brand-50 means "faintest brand tint behind something", brand-700 means
+  "brand, readable as text" — so on a dark page those two have to swap luminance or every
+  tinted panel turns into a glowing block and every accent label becomes unreadable.
+  brand-600 stays a true vivid purple because it is the primary button fill in both themes.
+*/
+:root[data-theme="dark"] {
+  --brand-50: 30 24 52;
+  --brand-100: 41 32 72;
+  --brand-200: 58 45 100;
+  --brand-300: 82 63 140;
+  --brand-400: 124 95 205;
+  --brand-500: 149 116 243;
+  --brand-600: 139 92 246;
+  --brand-700: 181 154 255;
+  --brand-800: 205 186 255;
+  --brand-900: 228 217 255;
+
+  --surface: 20 20 26;
+  --surface-muted: 12 12 16;
+  --surface-sunken: 28 28 36;
+
+  --ink: 244 244 247;
+  --ink-soft: 194 194 208;
+  --ink-muted: 143 143 163;
+  --ink-faint: 100 100 122;
+
+  --line: 39 39 49;
+  --line-strong: 54 54 67;
+
+  --positive: 52 199 136;
+  --negative: 255 107 107;
+  --caution: 245 176 65;
+
+  /* On a dark page a soft grey shadow is invisible; depth comes from a deeper cast plus the
+     lifted surface colour itself. */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-lift: 0 8px 24px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-brand: 0 4px 18px rgba(139, 92, 246, 0.4);
+
+  color-scheme: dark;
+}
+
+/* System preference, unless the user has explicitly chosen light in-app. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --brand-50: 30 24 52;
+    --brand-100: 41 32 72;
+    --brand-200: 58 45 100;
+    --brand-300: 82 63 140;
+    --brand-400: 124 95 205;
+    --brand-500: 149 116 243;
+    --brand-600: 139 92 246;
+    --brand-700: 181 154 255;
+    --brand-800: 205 186 255;
+    --brand-900: 228 217 255;
+
+    --surface: 20 20 26;
+    --surface-muted: 12 12 16;
+    --surface-sunken: 28 28 36;
+
+    --ink: 244 244 247;
+    --ink-soft: 194 194 208;
+    --ink-muted: 143 143 163;
+    --ink-faint: 100 100 122;
+
+    --line: 39 39 49;
+    --line-strong: 54 54 67;
+
+    --positive: 52 199 136;
+    --negative: 255 107 107;
+    --caution: 245 176 65;
+
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+    --shadow-lift: 0 8px 24px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.35);
+    --shadow-brand: 0 4px 18px rgba(139, 92, 246, 0.4);
+
+    color-scheme: dark;
+  }
+}
+
+html,
+body {
+  height: 100%;
+}
+
+html {
+  scroll-padding-top: 7rem;
+}
+
+body {
+  @apply bg-surface text-ink antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  overflow-x: hidden;
+  /* Theme swaps would otherwise flash every surface at once. Transitioning only the two
+     properties that actually change keeps it calm without animating layout. */
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+::selection {
+  background: rgb(var(--brand-200));
+  color: rgb(var(--ink));
+}
+
+[id] {
+  scroll-margin-top: 7rem;
+}
+
+/* Tabular figures everywhere a number can change in place — balances, countdowns, prices.
+   Without this, digits have different widths and the value visibly jitters as it updates. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.page-title {
+  @apply text-2xl font-semibold tracking-tight text-ink;
+}
+.page-subtitle {
+  @apply mt-1 text-sm text-ink-muted;
+}
+
+/* Hides a scrollbar without removing the ability to scroll — for the chip rails. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Sweeping highlight for skeletons: a static grey block reads as broken, a moving one reads
+   as loading. */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background-image: linear-gradient(
+    90deg,
+    transparent,
+    rgb(var(--ink) / 0.05),
+    transparent
+  );
+  animation: shimmer 1.6s infinite;
+}
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Thin, unobtrusive scrollbars that match whichever surface is behind them. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-line-strong;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-ink-faint;
+}
+
+/* Keyboard focus stays visible and on-brand; mouse clicks don't get a ring. */
+:focus-visible {
+  outline: 2px solid rgb(var(--brand-600));
+  outline-offset: 2px;
+  scroll-margin-block: 7rem 2rem;
+}
+
+/* Jump straight past the navigation. Visually hidden until focused. */
+.skip-link {
+  @apply absolute left-4 top-4 z-[100] -translate-y-24 rounded-full bg-brand-600 px-5 py-2.5 text-sm font-medium text-white transition-transform;
+}
+.skip-link:focus {
+  @apply translate-y-0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Chrome/Safari draw number spinners that clash with the flat inputs and let a stray
+   scroll change a price. Hidden here; the fields are typed into, not stepped. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* The native date/time picker indicator is black by default and disappears on a dark field. */
+:root[data-theme="dark"] input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+:root[data-theme="dark"] input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1) opacity(0.6);
+}
