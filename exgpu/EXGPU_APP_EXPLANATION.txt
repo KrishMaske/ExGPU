@@ -1,0 +1,1414 @@
+ExGPU Application Explanation
+=============================
+
+This document is a project map for the ExGPU repository as it exists now. It
+explains the purpose of the folders and files, how the implemented runtime
+flows work, and where the current implementation differs from the larger GPU
+Compute Exchange roadmap described in the planning documents.
+
+Last verified against source: 2026-06-13. Every claim below was checked against
+the actual Java, SQL, properties, and Docker Compose files in this commit, not
+inferred from the roadmap documents.
+
+Scope notes
+-----------
+
+- This project is a backend service. There is no frontend application in the
+  repository.
+- The runnable app lives in the `exgpu/` Maven module.
+- The important source of truth is `exgpu/src/main/java`,
+  `exgpu/src/main/resources`, `exgpu/pom.xml`, and the local infrastructure
+  files under `exgpu/docker-compose.yml`, `exgpu/prometheus`, and
+  `exgpu/grafana`.
+- `exgpu/target/` is generated Maven build output. It is useful for seeing old
+  test reports, but it should not be edited or treated as product source.
+- The root `.docx` files describe a larger target architecture. Some of that is
+  implemented; some is still planned.
+
+1. What ExGPU is
+----------------
+
+ExGPU is a Spring Boot backend prototype for a GPU compute exchange.
+
+The core product idea is a market where GPU providers submit sell orders for
+available compute and buyers submit buy orders for requested compute. Unlike a
+normal financial order book that matches mainly on price and quantity, ExGPU
+also matches on a time window. A valid match needs:
+
+1. Compatible side: BUY vs SELL.
+2. Compatible price: buy price >= sell price.
+3. Available quantity on both orders.
+4. Overlapping time windows.
+
+When a match happens, the app creates an `Allocation`. Usage for that allocation
+can then be billed against a buyer token balance through either a REST endpoint
+or a Kafka usage-event consumer.
+
+Implemented today:
+
+- Spring Boot REST API for orders, allocations, balances, usage events, and
+  ledger reads.
+- In-memory matching engine with buy and sell books.
+- PostgreSQL schema managed by Flyway.
+- JPA persistence for orders, allocations, token balances, and usage ledger.
+- Kafka consumer for JSON usage events.
+- Dead-letter queue publishing for failed usage-event processing.
+- Micrometer metrics exposed through Spring Actuator.
+- Prometheus and Grafana local observability config.
+- Unit and MVC-slice tests for the main matching, billing, Kafka, and API paths.
+
+Not implemented yet, despite being in the roadmap documents:
+
+- No frontend UI.
+- No provider simulator that emits telemetry.
+- No Avro schemas or Schema Registry integration.
+- No `compute-commands` Kafka topic or real `KillCompute` publisher.
+- No SSH provisioning, provider agent, or real GPU access workflow.
+- No order cancellation endpoint or expiry sweep.
+- No recurrent order lifecycle beyond fields on the `Order` entity.
+- No Redis-backed state or cache, even though Redis is in Docker Compose and
+  listed as a Maven dependency.
+- No order-book rebuild from PostgreSQL after app restart.
+- No advanced time-slice lock implementation; `TimeSliceLockManager` is empty.
+
+2. Runtime architecture
+-----------------------
+
+The app is currently a single Spring Boot process. Conceptually it contains
+three layers:
+
+1. Matching layer
+   - REST receives orders.
+   - `OrderService` persists orders.
+   - `MatchingEngine` mutates in-memory order books and produces allocations.
+   - `OrderService` persists updated orders and allocation rows.
+
+2. Telemetry ingestion layer
+   - REST can submit usage directly through `POST /usage-events`.
+   - Kafka can submit usage through `UsageEventConsumer`.
+   - Both paths call the same `BillingService`.
+   - Failed Kafka messages are published to a DLQ topic.
+
+3. Billing layer
+   - `BillingService` deduplicates by event id.
+   - It calculates token cost.
+   - It deducts from `TokenBalance`.
+   - It writes a `UsageLedger` row.
+   - If balance reaches zero, the response sets `computeKilled=true` and a
+     metric is incremented.
+
+This monolithic implementation is pragmatic for a portfolio/local prototype.
+It makes the system easy to run and understand. The tradeoff is that matching,
+billing, telemetry handling, and REST concerns are deployed together and share
+process-level state.
+
+3. Main workflows
+-----------------
+
+3.1 Order placement and matching
+
+Entry point:
+
+- `POST /orders`
+- Controller: `OrderController.placeOrder`
+- Service: `OrderService.placeOrder`
+- Engine: `MatchingEngine.submitOrder`
+
+Flow:
+
+1. The request is validated by Bean Validation on `CreateOrderRequest`.
+2. `OrderService` rejects windows where `startTime` is not before `endTime`.
+3. If `ownerId` is omitted, a random UUID is assigned.
+4. A new `Order` entity is built with status `OPEN` and a priority timestamp.
+5. The order is saved first so JPA assigns an id.
+6. The saved order is submitted to `MatchingEngine`.
+7. The engine scans the opposite-side in-memory book.
+8. It filters candidates by matchable status, price compatibility, and time
+   overlap.
+9. It sorts candidates by best price and then priority timestamp.
+10. It creates `Allocation` objects for fills and updates filled quantities.
+11. `OrderService` merges updated counterpart orders back into JPA.
+12. `OrderService` saves allocation rows.
+13. Metrics are incremented.
+14. The response returns the order, match status, matched quantity, and
+    allocation list.
+
+Tradeoffs:
+
+- Saving before matching gives the engine a real UUID to use in allocations.
+  The downside is the engine receives a JPA entity and mutates it directly,
+  which couples matching behavior to persistence objects.
+- The engine stores previous orders in memory. That is fast, but a restart
+  loses active book state unless a rebuild step is added.
+- `submitOrder` is synchronized. This is simple and safe for the current code,
+  but it serializes all matching and does not meet the roadmap's concurrent
+  time-slice locking design.
+
+3.2 Allocation lookup
+
+Entry points:
+
+- `GET /allocations`
+- `GET /orders/{id}/allocations`
+
+Flow:
+
+1. `AllocationController` or `OrderController` calls `AllocationService`.
+2. `findAll` returns every allocation sorted by `createdAt`.
+3. `findByOrderId` first checks that the order exists, then fetches allocations
+   where the order is either the buy side or the sell side.
+
+Tradeoff:
+
+- The explicit order existence check produces a clearer 404 for unknown orders,
+  but it costs one extra database query.
+
+3.3 Balance creation and top-up
+
+Entry points:
+
+- `POST /balances`
+- `GET /balances/{ownerId}`
+
+Flow:
+
+1. `BalanceController` calls `BillingService`.
+2. `createOrTopUp` either creates a new `TokenBalance` or calls `topUp` on an
+   existing one.
+3. `findBalance` returns the current balance or 404.
+
+Tradeoffs:
+
+- `TokenBalance` uses JPA optimistic locking with `@Version`. This is better
+  than blind writes under concurrent billing, but the app currently surfaces
+  conflicts as 409 instead of retrying.
+- Pessimistic database locking would be simpler to reason about for a single
+  row, but it would bottleneck billing traffic for active buyers.
+
+3.4 Usage billing through REST
+
+Entry point:
+
+- `POST /usage-events`
+
+Flow:
+
+1. `UsageEventController` validates `SubmitUsageEventRequest`.
+2. `BillingService.submitUsageEvent` checks for an existing ledger row with the
+   same event id.
+3. Duplicates return the existing ledger information and do not deduct again.
+4. New events load the allocation and buyer balance.
+5. The service validates that requested usage seconds do not exceed the
+   allocation window duration.
+6. Cost is calculated as:
+
+   cost = (gpuSeconds / 3600) * allocation.quantity * pricePerGpuHour
+
+7. The buyer balance is deducted.
+8. A `UsageLedger` row is saved with the event id as the idempotency key.
+9. The response includes remaining balance and whether compute should be killed.
+
+Important semantic note:
+
+- The field is named `gpuSeconds`, but the current formula treats it like
+  elapsed seconds for the whole allocation and then multiplies by allocation
+  quantity. If producers send already-aggregated GPU-seconds, the service would
+  multiply by quantity again. The API contract should be made explicit before
+  real telemetry producers are added.
+
+Tradeoffs and risks:
+
+- Idempotency is backed by both a service-level lookup and a database unique
+  constraint. That is a good baseline. However, two identical events processed
+  concurrently can still race between lookup and insert; the code does not
+  currently catch unique-constraint violations and convert them into duplicate
+  responses.
+- The billing request supplies `pricePerGpuHour`. The matched allocation does
+  not store the agreed execution price. That keeps `Allocation` simple, but it
+  means billing trusts the API/Kafka sender for price. A production design
+  should persist the execution price on the allocation or derive it from the
+  matched orders.
+
+3.5 Usage billing through Kafka
+
+Entry point:
+
+- Kafka topic configured by `exgpu.kafka.usage-events-topic`
+- Default topic: `exgpu.usage-events`
+- Consumer: `UsageEventConsumer.consume`
+
+Flow:
+
+1. Spring Kafka receives a `ConsumerRecord<String, UsageEventMessage>`.
+2. If the message value is null, the consumer treats it as a deserialization
+   failure and publishes a `DlqMessage`.
+3. If the message is valid, it is mapped into `SubmitUsageEventRequest`.
+4. `BillingService.submitUsageEvent` handles billing.
+5. Duplicate events are logged and not sent to DLQ.
+6. Any exception from billing is caught and published to the DLQ topic.
+
+How the null value actually arises (the deserialization mechanism):
+
+- `application.properties` configures the consumer value deserializer as
+  `ErrorHandlingDeserializer` wrapping a delegate `JsonDeserializer`.
+- The delegate is told the default value type is
+  `com.exgpu.exgpu.kafka.UsageEventMessage` and that only the
+  `com.exgpu.exgpu.kafka` package is trusted for type resolution.
+- When the delegate cannot parse a record (malformed JSON, wrong shape), the
+  `ErrorHandlingDeserializer` swallows the exception and hands the listener a
+  `null` value instead of throwing. That is precisely why `record.value() ==
+  null` is the consumer's signal for "deserialization failure" in step 2.
+- Tradeoff: this keeps a poison message from killing the listener thread, but
+  it also means the original bad bytes are gone by the time the listener runs.
+  The DLQ message can only record the partition/offset, not the raw payload,
+  for this failure class. A `DefaultErrorHandler` +
+  `DeadLetterPublishingRecoverer` wired to the raw byte record would preserve
+  the original payload and centralize retry/backoff policy.
+
+Tradeoffs:
+
+- The consumer catches all failures so one bad event does not crash the
+  listener. That keeps consumption resilient, but it makes DLQ monitoring
+  operationally important.
+- DLQ publishing is coded manually with `KafkaTemplate`. A Spring Kafka
+  `DefaultErrorHandler` plus `DeadLetterPublishingRecoverer` would centralize
+  retry and DLQ policy, but would add more framework configuration.
+- Kafka values are JSON records, not Avro. JSON is simpler for local
+  development; Avro plus Schema Registry would provide stronger compatibility
+  guarantees for independently deployed producers and consumers.
+
+3.6 Observability flow
+
+Flow:
+
+1. `ExgpuMetrics` registers named Micrometer counters and a billing timer.
+2. Spring Actuator exposes `/actuator/prometheus`.
+3. Prometheus scrapes that endpoint.
+4. Grafana provisions Prometheus as a datasource and loads the ExGPU dashboard.
+
+Tradeoffs:
+
+- Handwritten business metrics are easy to understand and map directly to app
+  behavior.
+- The current metric set is not a full production SLO package. It lacks things
+  like HTTP latency panels, database pool health, JVM pressure panels, retry
+  counts, and order-book depth gauges.
+
+4. Key implementation tradeoffs
+-------------------------------
+
+4.1 Single Spring Boot service vs split services
+
+Current choice:
+
+- Matching, REST, billing, Kafka consumption, and metrics live in one app.
+
+Why it works here:
+
+- Easy local development.
+- Fewer deployment pieces.
+- Simpler transaction boundaries.
+- Good for getting the core domain working.
+
+Cost:
+
+- Matching and billing scale together even though they have different load
+  patterns.
+- A billing outage can affect the whole process.
+- The matching engine stores process-local state, which does not compose cleanly
+  with horizontal replicas.
+
+4.2 In-memory order book vs database-backed order book
+
+Current choice:
+
+- `MatchingEngine` uses `ConcurrentHashMap<UUID, Order>` for buy and sell
+  books.
+
+Why it works here:
+
+- Fast access.
+- Simple tests.
+- No complex query tuning for every match attempt.
+
+Cost:
+
+- On restart, open orders in PostgreSQL are not automatically reloaded into the
+  engine.
+- Multiple app instances would each have their own book and could double-match.
+- DB state and in-memory state need careful synchronization.
+
+Alternative:
+
+- A startup rebuild from `orders` where status is `OPEN` or `PARTIALLY_FILLED`.
+- An event-sourced book that can replay order events.
+- A database-first matcher using row locks.
+- A distributed state store, if multi-instance matching is required.
+
+4.3 Synchronized matcher vs time-slice locking
+
+Current choice:
+
+- `submitOrder` is `synchronized`, so only one order can match at a time.
+
+Why it works here:
+
+- It avoids double-allocation bugs inside the in-memory matcher.
+- It keeps the code small and easy to reason about.
+
+Cost:
+
+- It caps throughput.
+- It does not exploit the fact that non-overlapping time windows could be
+  matched concurrently.
+- The empty `TimeSliceLockManager` shows the intended next design has not been
+  built.
+
+Alternative:
+
+- Lock ordered time buckets for the matched window.
+- Use a sorted lock acquisition order to prevent deadlocks.
+- Keep independent price levels or time slices matchable in parallel.
+
+4.4 JPA entities as domain objects vs separate domain model
+
+Current choice:
+
+- Entities like `Order`, `Allocation`, and `TokenBalance` contain both
+  persistence mapping and domain behavior.
+
+Why it works here:
+
+- Less boilerplate.
+- Natural fit for Spring Data JPA.
+- The service can persist and return the same object graph.
+
+Cost:
+
+- The matching engine mutates JPA entities, making it less pure and less
+  portable.
+- Detached entities are stored in the in-memory book and later merged.
+- Persistence annotations leak into domain logic.
+
+Alternative:
+
+- Pure domain models for matching, plus persistence mappers.
+- More code, but clearer boundaries.
+
+4.5 Flyway schema vs Hibernate DDL
+
+Current choice:
+
+- Flyway owns schema creation. Hibernate DDL is disabled.
+
+Why it works here:
+
+- Database constraints and indexes are explicit.
+- Schema changes are reviewable and reproducible.
+- Safer than allowing Hibernate to mutate production schema.
+
+Cost:
+
+- Entity and migration drift must be managed manually.
+- Tests are mostly mocked/sliced, so migration/entity drift might not be caught
+  until an integration test or local run with Postgres.
+
+4.6 JSON Kafka messages vs Avro
+
+Current choice:
+
+- `UsageEventMessage` and `DlqMessage` are Java records serialized as JSON.
+
+Why it works here:
+
+- No Schema Registry required.
+- Easier to manually publish test messages.
+- Less infrastructure for local development.
+
+Cost:
+
+- Weaker schema evolution guarantees.
+- Producers can drift from consumers more easily.
+- Type mistakes are caught later than with a registered schema.
+
+4.7 Explicit metrics wrapper vs scattered meter calls
+
+Current choice:
+
+- `ExgpuMetrics` centralizes counter/timer registration and increment methods.
+
+Why it works here:
+
+- Metric names are easy to audit.
+- Services do not need to know Micrometer construction details.
+
+Cost:
+
+- Every new metric requires a new field and wrapper method.
+- There are no tags yet, so metrics cannot be sliced by side, status, topic, or
+  error type.
+
+5. Important risks and correctness notes
+----------------------------------------
+
+1. Active order book is not durable across restarts.
+   - PostgreSQL stores open orders, but `MatchingEngine` starts empty.
+   - `GET /orders/open` can show open DB orders that the engine will not match
+     unless they were submitted during the current process lifetime.
+
+2. `TimeWindow` boundary semantics are inconsistent with the intended half-open
+   interval from the implementation guide.
+   - Current `overlaps` treats adjacent windows as overlapping.
+   - Example: `[10:00, 11:00]` and `[11:00, 12:00]` overlap under current code.
+   - `intersection` would produce `[11:00, 11:00]`.
+   - The database rejects allocation rows where `window_end <= window_start`.
+   - This should be fixed before production use by using half-open semantics:
+     overlap only if `start < other.end && other.start < end`.
+
+3. Matched execution price is not stored.
+   - Orders store bid/ask prices.
+   - Allocations only store order ids, quantity, and window.
+   - Billing accepts price from the usage event.
+   - A safer design stores execution price on `allocations` and uses that for
+     billing.
+
+4. Billing idempotency is good but not fully race-proof at the service layer.
+   - The database unique constraint is the final guard.
+   - The service should catch duplicate-key exceptions and return the existing
+     ledger response.
+
+5. `KillCompute` is not a real event yet.
+   - The app returns `computeKilled=true` and increments a metric.
+   - No Kafka command is published and no allocation status is changed to
+     `KILLED`.
+
+6. Usage semantics need clarification.
+   - If `gpuSeconds` is wall-clock seconds for an allocation, the current formula
+     is consistent with tests.
+   - If `gpuSeconds` is already aggregate GPU-seconds, the current formula
+     overcharges by multiplying by quantity again.
+
+7. No real integration tests currently prove Postgres, Flyway, Kafka, and
+   serialization together.
+   - The test suite is useful and fast, but mostly unit tests and MVC slices.
+
+6. Folder-by-folder map
+-----------------------
+
+Repository root
+
+- `.git/`
+  - Git metadata. Not application code.
+
+- `.github/`
+  - Contains automation/support hook folders named `java-upgrade` and
+    `modernize/java-upgrade`.
+  - These are not GitHub Actions workflows. They contain scripts that record
+    tool-use events into JSON files under their hook folders.
+
+- `.claude/`
+  - Local Claude/Codex-style tool permission settings.
+  - Not runtime application code.
+
+- `.vscode/`
+  - VS Code Java settings.
+  - Not runtime application code.
+
+- `exgpu/`
+  - The actual Maven/Spring Boot application module.
+
+Inside `exgpu/`
+
+- `.mvn/wrapper/`
+  - Maven wrapper metadata.
+  - Configures the wrapper to download/use Maven 3.9.14.
+
+- `grafana/`
+  - Grafana provisioning and dashboard files for local observability.
+
+- `prometheus/`
+  - Prometheus scrape config.
+
+- `src/main/java/com/exgpu/exgpu/`
+  - Java production code.
+
+- `src/main/resources/`
+  - Spring application properties, Flyway migrations, and empty static/template
+    folders from the Spring Boot scaffold.
+
+- `src/test/java/com/exgpu/exgpu/`
+  - Unit, Kafka-consumer, service, and MVC-slice tests.
+
+- `src/test/resources/`
+  - Test application properties that disable infrastructure autoconfiguration.
+
+- `target/`
+  - Generated Maven classes, test classes, compiler metadata, and surefire
+    reports.
+
+Java package folders
+
+- `controller/`
+  - Thin REST API layer.
+
+- `domain/`
+  - JPA entities and core value/result objects.
+
+- `domain/enums/`
+  - Enum types used by entities and matching results.
+
+- `dto/`
+  - API request and response records.
+
+- `engine/`
+  - Matching engine and placeholder lock manager.
+
+- `kafka/`
+  - Kafka message records and usage-event consumer.
+
+- `metrics/`
+  - Micrometer metric definitions.
+
+- `repository/`
+  - Spring Data JPA repository interfaces.
+
+- `service/`
+  - Application services that coordinate validation, persistence, matching, and
+    billing.
+
+7. File-by-file explanation
+---------------------------
+
+7.1 Root files
+
+`.gitignore`
+
+- Ignores generated Maven output, Maven wrapper jar, IDE metadata, `.docx`
+  files, and `leaks-report.json`.
+- Important detail: it ignores `HELP.md`, but `exgpu/HELP.md` exists in the
+  working tree.
+- Tradeoff: keeping `.docx` files ignored avoids committing binary planning
+  artifacts, but it also means important scope documents can be absent for other
+  contributors unless shared separately.
+
+`CLAUDE.md`
+
+- High-level project guidance and roadmap.
+- Describes the desired three-layer architecture: matching engine, telemetry
+  pipeline, and billing engine.
+- Includes future SSH-based GPU access concepts.
+- Best read as intent, not as proof that every feature exists.
+
+`GPU_Compute_Exchange_Scope.docx`
+
+- Original scope document for a "GPU Compute Exchange" or "GCX".
+- Defines the portfolio/project goal: B2B spot market for ephemeral GPU compute.
+- Describes the target 3D order book, Kafka telemetry, billing, Docker Compose,
+  Prometheus/Grafana, and ADRs.
+- Also lists out-of-scope areas like real cloud provider integrations, frontend,
+  compliance, multi-region routing, forecasting, and production security.
+
+`GCX_Implementation_Guide.docx`
+
+- Step-by-step target build guide.
+- Lists planned files such as `OrderBookStore`, `OverlapCalculator`,
+  `KafkaConfig`, Avro schemas, `UsageAggregator`, `KillComputePublisher`,
+  concurrency tests, README, and ADRs.
+- Many of these planned files are not present in the current repo.
+- Useful for understanding where the project is intended to go next.
+
+`leaks-report.json`
+
+- Contains an empty JSON array: `[]`.
+- Looks like a generated security/leak scan result with no findings.
+- It is ignored by `.gitignore`.
+
+`.claude/settings.local.json`
+
+- Local agent/tool permission config.
+- Allows selected Maven test and PowerShell inspection commands for the Claude
+  environment.
+- Not used by the Spring Boot app.
+
+`.vscode/settings.json`
+
+- VS Code Java settings.
+- Enables automatic Java null analysis and interactive build configuration
+  updates.
+- Development convenience only.
+
+`.github/java-upgrade/.gitignore`
+
+- Contains `**/*`, which ignores generated hook output inside that folder.
+
+`.github/java-upgrade/hooks/scripts/recordToolUse.ps1`
+
+- PowerShell hook script.
+- Reads JSON from stdin, extracts `tool_name` and `session_id`, and records
+  certain tool calls as JSON lines under `.github/java-upgrade/hooks`.
+
+`.github/java-upgrade/hooks/scripts/recordToolUse.sh`
+
+- Bash version of the same tool-use recorder.
+
+`.github/modernize/java-upgrade/.gitignore`
+
+- Same purpose as the other java-upgrade `.gitignore`.
+
+`.github/modernize/java-upgrade/hooks/scripts/recordToolUse.ps1`
+
+- PowerShell recorder variant that writes under
+  `.github/modernize/java-upgrade/hooks`.
+
+`.github/modernize/java-upgrade/hooks/scripts/recordToolUse.sh`
+
+- Bash recorder variant that writes under
+  `.github/modernize/java-upgrade/hooks`.
+
+7.2 Maven module files
+
+`exgpu/pom.xml`
+
+- Maven build definition for the Spring Boot app.
+- Uses Spring Boot parent `3.5.12` and Java 21.
+- Main dependencies:
+  - Spring Web for REST controllers.
+  - Spring Data JPA for persistence.
+  - PostgreSQL runtime driver.
+  - Flyway for schema migrations.
+  - Spring Kafka for Kafka listener and DLQ publishing.
+  - Spring Data Redis dependency, although Redis auto-configuration is disabled.
+  - Spring Boot Actuator and Micrometer Prometheus registry.
+  - Bean Validation.
+  - Lombok.
+  - springdoc OpenAPI UI.
+  - Spring Boot test and Spring Kafka test.
+- Tradeoffs:
+  - Dependencies are broad enough for the roadmap, but some are not active yet
+    (`spring-boot-starter-data-redis`, springdoc customization).
+  - No Avro or Schema Registry dependencies are present, unlike the original
+    guide.
+  - No Testcontainers dependency is present, so current tests do not spin up
+    real infrastructure.
+
+`exgpu/mvnw`
+
+- Unix shell Maven wrapper script.
+- Lets contributors run Maven without a globally installed Maven.
+
+`exgpu/mvnw.cmd`
+
+- Windows Maven wrapper script.
+
+`exgpu/.mvn/wrapper/maven-wrapper.properties`
+
+- Maven wrapper configuration.
+- Uses wrapper version 3.3.4 and downloads Maven 3.9.14 from Maven Central.
+- `distributionType=only-script` means the wrapper jar is not committed.
+
+`exgpu/.gitattributes`
+
+- Normalizes line endings for Maven wrapper files.
+- `mvnw` uses LF.
+- `*.cmd` uses CRLF.
+
+`exgpu/HELP.md`
+
+- Spring Initializr generated reference links.
+- Not part of runtime behavior.
+- Useful only as starter documentation for Maven and Spring dependencies.
+
+`exgpu/EXGPU_APP_EXPLANATION.txt`
+
+- This document.
+- Human-readable project explanation and implementation map.
+
+`exgpu/docker-compose.yml`
+
+- Local infrastructure stack.
+- Services:
+  - PostgreSQL 16 on port 5432.
+  - Redis 7 on port 6379.
+  - Zookeeper.
+  - Kafka on port 9092.
+  - Prometheus on port 9090.
+  - Grafana on port 3000.
+- Tradeoffs:
+  - Kafka uses Zookeeper rather than KRaft-only mode. This is common and easy
+    for examples, but not the newest Kafka deployment style.
+  - Kafka advertises `PLAINTEXT://localhost:9092`, which is convenient for the
+    Spring app running on the host. Container-to-container Kafka clients may
+    need different listener settings.
+  - Redis runs even though the app excludes Redis auto-configuration.
+  - There is no Schema Registry service, despite the roadmap mentioning Avro.
+
+7.3 Observability files
+
+`exgpu/prometheus/prometheus.yml`
+
+- Prometheus config.
+- Scrapes `host.docker.internal:8080/actuator/prometheus` every 15 seconds.
+- Tradeoff:
+  - This assumes the Spring Boot app runs on the host machine while Prometheus
+    runs in Docker. On some Linux setups, `host.docker.internal` may need
+    explicit Docker configuration.
+
+`exgpu/grafana/provisioning/datasources/prometheus.yml`
+
+- Auto-provisions Prometheus as Grafana's default datasource.
+- Uses the internal Docker service URL `http://prometheus:9090`.
+
+`exgpu/grafana/provisioning/dashboards/dashboard.yml`
+
+- Tells Grafana to load dashboards from `/var/lib/grafana/dashboards`.
+
+`exgpu/grafana/dashboards/exgpu.json`
+
+- Grafana dashboard JSON.
+- Panels:
+  - Orders submitted.
+  - Matches created.
+  - Allocations created.
+  - Usage events processed.
+  - Duplicate events skipped.
+  - DLQ events.
+  - Billing deductions.
+  - Kill compute events.
+  - Billing processing latency p50/p99.
+  - Kafka consumer lag.
+- Tradeoff:
+  - Good operational start for business metrics.
+  - Not yet a complete service health dashboard.
+
+7.4 Application resources
+
+`exgpu/src/main/resources/application.properties`
+
+- Main local app configuration.
+- Sets app name and port 8080.
+- Disables Redis auto-configuration by excluding `RedisAutoConfiguration` and
+  `RedisRepositoriesAutoConfiguration`.
+- Configures Jackson to write Java time values as ISO-8601 strings
+  (`write-dates-as-timestamps=false`).
+- Configures PostgreSQL datasource (localhost:5432, db/user/pass all `exgpu`).
+- Disables Hibernate DDL with `spring.jpa.hibernate.ddl-auto=none`.
+- Disables open-session-in-view (`spring.jpa.open-in-view=false`), which is the
+  correct choice for a REST API and avoids lazy-loading outside the service
+  transaction.
+- Enables SQL logging.
+- Sets Hibernate JDBC timezone to UTC.
+- Configures the Kafka consumer to use `ErrorHandlingDeserializer` over a
+  `JsonDeserializer` delegate, with trusted package `com.exgpu.exgpu.kafka`
+  and default value type `UsageEventMessage`. The producer uses a String key
+  serializer and `JsonSerializer` for values.
+- Defines usage-event topic (`exgpu.usage-events`) and DLQ topic
+  (`exgpu.usage-events.dlq`).
+- Exposes Actuator health, info, and prometheus endpoints.
+- Enables Flyway and points it to `classpath:db/migrations`.
+- Dead config worth cleaning up:
+  - The file still sets `spring.data.redis.host` and `spring.data.redis.port`
+    even though Redis auto-configuration is excluded and no code uses Redis.
+    These lines have no effect today and should be removed until Redis is
+    actually wired in.
+- Tradeoff:
+  - Good local defaults, but credentials and hostnames are hardcoded for local
+    Docker Compose. Production needs environment-specific overrides (env vars
+    or a profile-specific properties file).
+
+`exgpu/src/main/resources/db/migrations/V1__init_schema.sql`
+
+- Initial Flyway schema.
+- Creates:
+  - `orders`
+  - `allocations`
+  - `token_balances`
+  - `usage_ledger`
+  - `audit_log`
+- Adds indexes for order matching (`status, window_start, window_end`), owner
+  lookup, allocation buy/sell lookup, and ledger idempotency lookup.
+- Adds constraints for positive quantity, non-negative price/balance, valid
+  windows (`window_end > window_start`), and unique idempotency keys.
+- Enforces a foreign-key chain that the Java layer relies on implicitly:
+  - `allocations.buy_order_id` / `sell_order_id` -> `orders.id`
+    (`ON DELETE CASCADE`).
+  - `usage_ledger.allocation_id` -> `allocations.id` (`ON DELETE CASCADE`).
+  - `usage_ledger.buyer_id` -> `token_balances.buyer_id` (no cascade). This
+    means a usage event can only be billed for a buyer that already has a
+    balance row; otherwise the insert fails at the database even before the
+    service's own 404 check would fire.
+- `usage_ledger` also enforces `gpu_seconds > 0` and `token_cost > 0`, so a
+  zero-cost or zero-second event is rejected at the database, not just by Bean
+  Validation on the request.
+- `orders` enforces `filled_quantity <= quantity`, a useful backstop against a
+  matcher bug that over-fills an order.
+- Tradeoffs:
+  - Strong schema constraints are good for data safety.
+  - The `audit_log` table is created and indexed but is currently unused by any
+    Java code — no entity, repository, or insert path references it.
+  - The schema does not store allocation execution price, which affects billing
+    trust and auditability.
+
+`exgpu/src/main/resources/static/`
+
+- Empty Spring Boot static asset directory.
+- No frontend assets are currently served.
+
+`exgpu/src/main/resources/templates/`
+
+- Empty Spring MVC/Thymeleaf-style templates directory.
+- No server-rendered pages are currently implemented.
+
+`exgpu/src/test/resources/application.properties`
+
+- Test override config.
+- Excludes DataSource, JPA, Flyway, Kafka, and Redis auto-configuration.
+- Keeps tests runnable without Docker Compose.
+- Tradeoff:
+  - Fast and simple tests.
+  - Less coverage of real database, migration, and Kafka wiring.
+
+7.5 Production Java files
+
+`src/main/java/com/exgpu/exgpu/ExgpuApplication.java`
+
+- Spring Boot entry point.
+- `@SpringBootApplication` enables component scanning and auto-configuration.
+- Contains no custom startup logic.
+
+`controller/OrderController.java`
+
+- REST controller under `/orders`.
+- Endpoints:
+  - `POST /orders`
+  - `GET /orders`
+  - `GET /orders/open`
+  - `GET /orders/{id}`
+  - `GET /orders/{id}/allocations`
+- Delegates to `OrderService` and `AllocationService`.
+- Keeps business logic out of the controller.
+
+`controller/AllocationController.java`
+
+- REST controller under `/allocations`.
+- Endpoint:
+  - `GET /allocations`
+- Delegates to `AllocationService`.
+
+`controller/BalanceController.java`
+
+- REST controller under `/balances`.
+- Endpoints:
+  - `POST /balances`
+  - `GET /balances/{ownerId}`
+- Delegates to `BillingService`.
+
+`controller/UsageEventController.java`
+
+- REST controller for usage billing and ledger inspection.
+- Endpoints:
+  - `POST /usage-events`
+  - `GET /usage-ledger`
+- Useful for manual/local billing tests even when Kafka is not producing events.
+
+`controller/GlobalExceptionHandler.java`
+
+- Centralized REST error handling for:
+  - Bean validation failures.
+  - `IllegalArgumentException`.
+  - JPA optimistic locking failures.
+- Returns `ProblemDetail` bodies.
+- Tradeoff:
+  - Improves consistency for handled errors.
+  - Does not explicitly handle every exception type; Spring handles
+    `ResponseStatusException` separately.
+
+`domain/Order.java`
+
+- JPA entity for the `orders` table.
+- Fields include owner, side, status, price, quantity, filled quantity, embedded
+  time window, recurring flags, priority timestamp, and created timestamp.
+- Methods:
+  - `remainingQuantity()`
+  - `isMatchable()`
+- Uses Lombok for getters, setters, builder, and constructors.
+- Tradeoff:
+  - Convenient persistence/domain object.
+  - Matching engine mutates it directly, so domain and JPA lifecycle are
+    coupled.
+
+`domain/Allocation.java`
+
+- JPA entity for the `allocations` table.
+- Created when a buy and sell order match.
+- Stores buy order id, sell order id, quantity, window, status, and created
+  timestamp.
+- Does not store agreed price.
+
+`domain/TimeWindow.java`
+
+- Embeddable value object for start/end instants.
+- Methods:
+  - `overlaps`
+  - `intersection`
+  - `contains`
+  - `durationMinutes`
+  - `equals`
+  - `hashCode`
+- Important caveat:
+  - It currently allows `start == end`.
+  - It treats boundary-adjacent windows as overlapping.
+  - The database requires `window_end > window_start`.
+
+`domain/TokenBalance.java`
+
+- JPA entity for `token_balances`.
+- Primary key is buyer id.
+- Stores balance, optimistic-lock version, created timestamp, and updated
+  timestamp.
+- Methods:
+  - `deduct`
+  - `topUp`
+  - `isExhausted`
+- Prevents negative balances in Java and in the database.
+
+`domain/UsageLedger.java`
+
+- JPA entity for `usage_ledger`.
+- Immutable-style ledger record for billed usage.
+- Stores allocation id, buyer id, usage seconds, token cost, idempotency key,
+  and created timestamp.
+- The idempotency key is unique.
+
+`domain/MatchResult.java`
+
+- Plain result object returned by the matching engine.
+- Contains allocations, updated orders, and match status.
+- Method `totalMatchedQuantity()` sums allocation quantities.
+- Tradeoff:
+  - Clean return boundary for tests.
+  - Still carries mutable `Order` entities in `updatedOrders`.
+
+`domain/enums/OrderSide.java`
+
+- Enum values: `BUY`, `SELL`.
+
+`domain/enums/OrderStatus.java`
+
+- Enum values: `OPEN`, `PARTIALLY_FILLED`, `FILLED`, `EXPIRED`, `CANCELLED`.
+- Only `OPEN` and `PARTIALLY_FILLED` are matchable in current code.
+
+`domain/enums/AllocationStatus.java`
+
+- Enum values: `ACTIVE`, `COMPLETED`, `KILLED`.
+- Current code creates active allocations. Completion/kill lifecycle is not
+  implemented yet.
+
+`domain/enums/MatchStatus.java`
+
+- Enum values: `FULL_FILL`, `PARTIAL_FILL`, `NO_MATCH`.
+
+`dto/CreateOrderRequest.java`
+
+- Request record for `POST /orders`.
+- Validates side, price, quantity, start time, and end time.
+- `ownerId` is optional.
+
+`dto/PlaceOrderResponse.java`
+
+- Response record for order placement.
+- Contains the order response, match status, total matched quantity, and
+  allocation responses.
+
+`dto/OrderResponse.java`
+
+- API read model for orders.
+- Flattens `TimeWindow` to `windowStart` and `windowEnd`.
+- Includes remaining quantity so clients do not recompute it.
+
+`dto/AllocationResponse.java`
+
+- API read model for allocations.
+- Flattens `TimeWindow` to `windowStart` and `windowEnd`.
+
+`dto/CreateBalanceRequest.java`
+
+- Request record for creating or topping up a balance.
+- `ownerId` is optional.
+- `amount` must be positive.
+
+`dto/BalanceResponse.java`
+
+- API read model for token balances.
+- Includes owner id, balance, version, and updated timestamp.
+
+`dto/SubmitUsageEventRequest.java`
+
+- Request record for usage billing.
+- Validates event id, allocation id, buyer id, usage seconds, and price.
+
+`dto/UsageEventResponse.java`
+
+- Response from processing a usage event.
+- Includes ledger id, allocation id, buyer id, usage seconds, cost, remaining
+  balance, compute-kill flag, duplicate flag, and created timestamp.
+
+`dto/UsageLedgerResponse.java`
+
+- API read model for ledger rows.
+- Includes the idempotency key for traceability.
+
+`engine/MatchingEngine.java`
+
+- Core matching implementation.
+- Maintains two in-memory books:
+  - `buyBook`
+  - `sellBook`
+- `submitOrder` is synchronized.
+- Matching rules:
+  - Candidate must be matchable.
+  - Buy price must be at least sell price.
+  - Time windows must overlap.
+  - Best price is chosen first.
+  - Priority timestamp breaks ties.
+- Produces `Allocation` objects with the intersection of the two windows.
+- Updates filled quantities and statuses on both orders.
+- Removes fully filled counterpart orders from the book.
+- Keeps partially filled incoming orders in the book.
+- Resting-order behavior: an incoming order that finds no compatible
+  counterpart (`NO_MATCH`) is still added to its own side's book, so it rests
+  and can be matched by a later opposite-side order. This is the standard
+  limit-order-book behavior and is easy to miss because the `NO_MATCH` status
+  makes it look like nothing happened.
+- Status determination: `FULL_FILL` vs `PARTIAL_FILL` is decided by whether the
+  incoming order is still matchable after the match loop. A fully filled
+  incoming order is not re-added to the book; a partially filled one is.
+- Note that `MatchResult` carries a `hasAllocations()` helper alongside
+  `totalMatchedQuantity()`, though `OrderService` currently branches on
+  `getAllocations().isEmpty()` directly.
+- Tradeoffs:
+  - Simple and testable.
+  - Not horizontally scalable.
+  - Does not persist/rebuild active book state.
+  - Uses full stream sorting of candidates each match attempt, which is fine
+    for small books but not ideal for large books.
+
+`engine/TimeSliceLockManager.java`
+
+- Empty placeholder class.
+- The implementation guide describes it as a future striped lock manager over
+  time buckets.
+- Current code does not use it.
+
+`kafka/UsageEventMessage.java`
+
+- Kafka value record for usage-event input.
+- Fields mirror `SubmitUsageEventRequest`.
+- Serialized/deserialized as JSON by Spring Kafka config.
+
+`kafka/DlqMessage.java`
+
+- Kafka value record for dead-letter messages.
+- Captures event id, original payload JSON, error type, error message, and
+  failure timestamp.
+
+`kafka/UsageEventConsumer.java`
+
+- Kafka listener for usage events.
+- Maps `UsageEventMessage` into `SubmitUsageEventRequest`.
+- Calls `BillingService`.
+- Sends null/deserialization failures and billing exceptions to the DLQ topic.
+- Logs duplicate events without DLQ.
+- Tradeoff:
+  - Direct synchronous billing call is simple, but Kafka throughput is tied to
+    billing latency and database performance.
+
+`metrics/ExgpuMetrics.java`
+
+- Central metric registry wrapper.
+- Registers:
+  - `exgpu_orders_submitted_total`
+  - `exgpu_matches_created_total`
+  - `exgpu_allocations_created_total`
+  - `exgpu_usage_events_processed_total`
+  - `exgpu_usage_events_duplicate_total`
+  - `exgpu_usage_events_dlq_total`
+  - `exgpu_billing_deductions_total`
+  - `exgpu_kill_compute_total`
+  - `exgpu_billing_processing_seconds`
+
+`repository/OrderRepository.java`
+
+- Spring Data JPA repository for `Order`.
+- Adds `findByStatusIn` with sorting for open-order reads.
+
+`repository/AllocationRepository.java`
+
+- Spring Data JPA repository for `Allocation`.
+- Adds a JPQL query for allocations where an order id is either buy or sell
+  side.
+
+`repository/TokenBalanceRepository.java`
+
+- Spring Data JPA repository for `TokenBalance`.
+- Uses default CRUD methods only.
+
+`repository/UsageLedgerRepository.java`
+
+- Spring Data JPA repository for `UsageLedger`.
+- Adds idempotency-key lookup methods: `findByIdempotencyKey` (used by
+  `BillingService` for the duplicate check) and `existsByIdempotencyKey`
+  (declared but currently unused — a candidate for removal or for replacing the
+  find-then-branch with an exists check where the existing row is not needed).
+- Re-declares `findAll(Sort)`, which `JpaRepository` already provides; the
+  explicit declaration is redundant but harmless.
+
+`service/OrderService.java`
+
+- Application service for order placement and order queries.
+- Owns the transaction for placing an order, matching, saving counterpart order
+  updates, and saving allocations.
+- Emits order/match/allocation metrics.
+- Persistence subtlety that the code comments call out explicitly:
+  - The incoming order is saved first, so it becomes a *managed* entity. The
+    engine then mutates that same managed instance (filledQuantity, status),
+    and those mutations are auto-flushed on commit — no second `save` for the
+    incoming order is needed.
+  - Counterpart orders living in the engine's in-memory book came from earlier
+    transactions and are therefore *detached*. Their mutated state must be
+    merged back with an explicit `orderRepository.save(...)`, which the loop
+    does for every updated order except the incoming one.
+  - Allocations have `id == null` and are inserted fresh via `saveAll`.
+- Tradeoff:
+  - Cohesive workflow in one transaction.
+  - Correctness depends on the in-memory book and the database staying in sync.
+    The service has to reason about which order objects are managed versus
+    detached, which is exactly the coupling that a pure-domain matcher with a
+    persistence mapper would remove.
+
+`service/AllocationService.java`
+
+- Read service for allocations.
+- Handles all-allocation list and by-order lookup.
+
+`service/BillingService.java`
+
+- Application service for balances and usage billing.
+- Handles:
+  - Create/top-up balance.
+  - Find balance.
+  - Submit usage event.
+  - Deduplicate usage event.
+  - Calculate cost.
+  - Deduct balance.
+  - Write usage ledger.
+  - Return all ledger entries.
+- Tradeoffs:
+  - Transactional and straightforward.
+  - No optimistic-lock retry loop yet.
+  - Does not publish a real kill command.
+  - Relies on event-provided price instead of allocation-stored price.
+
+7.6 Test files
+
+Verified test inventory (count of `@Test` methods in current source = 43):
+
+- `MatchingEngineTest` — 9
+- `BillingServiceTest` — 14
+- `OrderControllerTest` — 11
+- `UsageEventConsumerTest` — 6
+- `AllocationControllerTest` — 2
+- `ExgpuApplicationTests` — 1
+
+All are JUnit 5. The engine, billing, and consumer tests are plain unit tests
+with Mockito; the controller tests are `@WebMvcTest` slices; the application
+test is a mocked context-load smoke test. None require Docker, Postgres, or a
+real Kafka broker, which is why `src/test/resources/application.properties`
+excludes those auto-configurations.
+
+`src/test/java/com/exgpu/exgpu/ExgpuApplicationTests.java`
+
+- Spring Boot context-load smoke test.
+- Mocks key repositories, engine, and Kafka template so the context can load
+  without infrastructure.
+
+`src/test/java/com/exgpu/exgpu/engine/MatchingEngineTest.java`
+
+- Unit tests for matching behavior.
+- Covers:
+  - Full fills.
+  - Partial fills.
+  - Price mismatch.
+  - Time-window mismatch.
+  - Allocation window intersection.
+  - Cheapest-seller priority for buy orders.
+  - Updated order tracking.
+- Missing useful edge case:
+  - Adjacent windows that touch at a boundary.
+
+`src/test/java/com/exgpu/exgpu/service/BillingServiceTest.java`
+
+- Unit tests for billing behavior with mocked repositories.
+- Covers:
+  - Balance creation.
+  - Top-ups.
+  - Random owner id assignment.
+  - Cost formula.
+  - Usage duration validation.
+  - Duplicate event suppression.
+  - Insufficient balance.
+  - Balance reaches zero.
+  - Unknown allocation.
+  - Unknown buyer.
+
+`src/test/java/com/exgpu/exgpu/kafka/UsageEventConsumerTest.java`
+
+- Unit tests for Kafka consumer behavior.
+- Covers:
+  - Valid message billing.
+  - Duplicate message handling.
+  - Null/deserialization failure to DLQ.
+  - Allocation-not-found to DLQ.
+  - Insufficient-balance to DLQ.
+  - Unexpected exception to DLQ.
+
+`src/test/java/com/exgpu/exgpu/controller/OrderControllerTest.java`
+
+- MVC-slice tests for `/orders`.
+- Covers:
+  - Successful order placement.
+  - Full-fill response shape.
+  - Validation errors.
+  - Order lookup.
+  - Unknown order 404.
+  - Order allocation lookup.
+  - All/open order list endpoints.
+
+`src/test/java/com/exgpu/exgpu/controller/AllocationControllerTest.java`
+
+- MVC-slice tests for `/allocations`.
+- Covers empty and non-empty allocation responses.
+
+7.7 Generated files
+
+`exgpu/target/`
+
+- Maven build output (generated; gitignored, so it may be absent in a fresh
+  clone and can be stale relative to current source).
+- Includes compiled classes, generated annotation sources, test classes, Maven
+  compiler status, and surefire reports.
+- The 43-method test suite enumerated in section 7.6 is counted from current
+  source, not from any surefire report; treat any numbers under `target/` as a
+  snapshot of whatever build last ran locally.
+- Because this is generated output, it should not be manually edited.
+
+8. Current API surface
+----------------------
+
+Orders:
+
+- `POST /orders`
+- `GET /orders`
+- `GET /orders/open`
+- `GET /orders/{id}`
+- `GET /orders/{id}/allocations`
+
+Allocations:
+
+- `GET /allocations`
+
+Balances:
+
+- `POST /balances`
+- `GET /balances/{ownerId}`
+
+Usage and ledger:
+
+- `POST /usage-events`
+- `GET /usage-ledger`
+
+Operations:
+
+- `GET /actuator/health`
+- `GET /actuator/info`
+- `GET /actuator/prometheus`
+
+OpenAPI:
+
+- springdoc is on the classpath, so standard springdoc endpoints are expected
+  when the app runs, but there is no custom OpenAPI configuration in the repo.
+
+9. How the roadmap documents compare to the repo
+------------------------------------------------
+
+Implemented from the scope/guide:
+
+- Maven Spring Boot backend.
+- PostgreSQL persistence.
+- Flyway initial migration.
+- Order, allocation, token balance, usage ledger models.
+- Basic 3D matching on price, quantity, and time window.
+- REST API for orders and balances.
+- Kafka usage-event consumer.
+- DLQ message publishing.
+- Prometheus metrics and Grafana dashboard.
+- Tests for matching, billing, Kafka consumer, and controllers.
+
+Partially implemented:
+
+- Billing engine exists, but has no real kill-command publisher.
+- Telemetry pipeline consumes usage events, but no producer simulator or
+  aggregation window exists.
+- Observability exists, but is business-metric oriented rather than complete
+  service health monitoring.
+- Order lifecycle states exist, but expiry/cancellation/completion behavior is
+  not implemented.
+
+Not implemented:
+
+- Avro schemas.
+- Schema Registry.
+- `KafkaConfig` topic declarations.
+- Provider telemetry simulator.
+- `UsageAggregator`.
+- `KillComputePublisher`.
+- `OrderBookStore`.
+- `OverlapCalculator`.
+- Real `TimeSliceLockManager`.
+- Concurrency integration tests.
+- Testcontainers.
+- ADR documents.
+- README front door.
+- SSH/provisioning domain model.
+
+10. Recommended next engineering steps
+--------------------------------------
+
+1. Fix `TimeWindow` boundary semantics and add tests for adjacent windows.
+2. Persist execution price on `Allocation` and bill from persisted allocation
+   data, not event-provided price.
+3. Add order-book rebuild on startup from open/partially filled DB orders.
+4. Decide and document the meaning of `gpuSeconds`.
+5. Catch ledger unique-constraint races and return duplicate responses.
+6. Add integration tests with PostgreSQL/Flyway and Kafka serialization.
+7. Implement real `KillCompute` publishing and allocation status updates.
+8. Either remove Redis from active dependencies/config or implement the feature
+   it is reserved for.
+9. Replace the synchronized matcher with a real time-slice locking design only
+   after the simpler matcher is fully covered by tests.
+10. Add README and ADRs so the project explains its decisions outside this
+    analysis file.
+
+11. Bottom line
+---------------
+
+ExGPU is a solid backend prototype for the hard part of a GPU compute market:
+matching compute supply and demand across price, quantity, and time. The code is
+cleanly grouped and already has useful tests and observability. The main
+engineering gap is not basic structure; it is production correctness around
+state durability, concurrent matching, exact time-window semantics, execution
+price persistence, and event-driven compute shutdown.
+
+The current implementation favors clarity and local development speed over
+distributed exchange-grade architecture. That is a reasonable stage for this
+project, as long as the roadmap items above are treated as real blockers before
+multi-instance deployment or real provider integration.
